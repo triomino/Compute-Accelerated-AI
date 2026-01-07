@@ -35,7 +35,7 @@ Run the container with the following command:
 ```bash
 image=vllm-ascend-qwen3-235b:latest
 docker run \
-    --name vllm-ascend-13temp \
+    --name vllm-ascend-13 \
     --device /dev/davinci_manager \
     --device /dev/devmm_svm \
     --device /dev/hisi_hdc \
