@@ -1,0 +1,23 @@
+--- origin.py   2026-01-07 05:50:51.329323692 +0000
++++ apply_token_bitmask_inplace_cpu.py  2026-01-06 06:49:58.879314002 +0000
+@@ -42,7 +42,12 @@
+     )
+
+     vocab_size = min(logits.shape[-1], bitmask.shape[-1] * 32) if vocab_size is None else vocab_size
+-
++    indices_list = None
++    if indices is not None:
++        if isinstance(indices, torch.Tensor):
++            indices_list = indices.tolist()
++        elif isinstance(indices, list):
++            indices_list = indices
+     _core.kernels.apply_token_bitmask_inplace_cpu(
+         logits.data_ptr(),
+         logits_shape,
+@@ -51,5 +56,5 @@
+         bitmask_shape,
+         bitmask_stride,
+         vocab_size,
+-        indices,
++        indices_list,
+     )
