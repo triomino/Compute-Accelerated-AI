@@ -15,7 +15,7 @@ git clone https://github.com/triomino/Compute-Accelerated-AI.git
 cd Compute-Accelerated-AI/ascend/vllm-ascend/Qwen3-235B
 
 # Build the image
-docker build -t vllm-ascend-qwen3-235b:latest .
+docker build --network none -t vllm-ascend-qwen3-235b:latest .
 ```
 
 ## Why vllm_ascend_fix.patch?
