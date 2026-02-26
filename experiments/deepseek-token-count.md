@@ -92,8 +92,8 @@ vllm-ascend 和 mindie 上，DeepSeek V3.1 Terminus 输出 token 数少于 DeepS
 
 ### 模型信息
 
-- **DeepSeek R1**: [请填写版本信息]
-- **DeepSeek V3.1 Terminus**: [请填写版本信息]
+- **DeepSeek R1**: https://www.modelscope.cn/models/Eco-Tech/DeepSeek-R1-0528-w8a8-mtp-QuaRot
+- **DeepSeek V3.1 Terminus**: https://www.modelscope.cn/models/Eco-Tech/DeepSeek-V3.1-w8a8-mtp-QuaRot
 
 ## 脚本（含问题和参数）
 用以下脚本提问
