@@ -1,8 +1,30 @@
-## vLLM 源码笔记：DeepSeek-V3.2 
-### 1 MLA
-#### 1.1 qkv 计算
-先计算 q_lora 和 kv_lora，然后。lora 这层硬编码不开 tp。
+## vLLM 源码笔记：DeepSeek-V3.2
+
+> **版本信息**：本文档基于 vLLM 0.13.0 版本代码进行分析。
+
+> **分析前提**：本文档的分析基于以下配置假设：
+> - Tensor Parallel (TP) > 1
+> - Data Parallel (DP) > 1  
+> - Expert Parallel (EP) = TP × DP
+
+---
+
+### 1 MLA (Multi-Head Latent Attention)
+
+#### 1.1 QKV 计算
+
+MLA 通过低秩压缩技术减少 KV Cache 的存储需求。核心计算流程如下：
+
+**低秩映射公式**：
+
+$$\mathbf{h} \in \mathbb{R}^{d} \rightarrow \mathbf{q}_c \in \mathbb{R}^{r_q}, \mathbf{kv}_{\text{lora}} \in \mathbb{R}^{r_{kv} + d_r}$$
+
+其中 $d$ 为 hidden_size (7168)，$r_q$ 为 q_lora_rank (1536)，$r_{kv}$ 为 kv_lora_rank (512)，$d_r$ 为 rope 维度 (64)。
+
+先计算 q_lora 和 kv_lora，然后进行升维投影。lora 这层硬编码不开 TP。
+
 ```python
+# File: vllm/model_executor/layers/mla.py:129
 # qkv 低秩映射
 qkv_lora = self.fused_qkv_a_proj(hidden_states)[0] # 7168->1536+512+64
 q_c, kv_lora = qkv_lora.split(
@@ -16,8 +38,16 @@ kv_c_normed = self.kv_a_layernorm(kv_c)
 q = q.view(-1, self.num_heads, self.qk_head_dim)
 k_pe = k_pe.unsqueeze(1) # (N,1,head_size)
 ```
+
+**Q 的升维投影**：
+
+$$\mathbf{q} = \mathbf{W}_q^{(b)} \cdot \text{RMSNorm}(\mathbf{q}_c) \in \mathbb{R}^{h \times (d_{qk}^{\text{nope}} + d_r)}$$
+
+其中 $h$ 为 num_heads (128)，$d_{qk}^{\text{nope}}$ = 128，$d_r$ = 64。
+
 其中 fused_qkv_a_proj 是把两个矩阵乘法合并了。
 ```python
+# File: vllm/model_executor/models/deepseek_v2.py:959
 if self.q_lora_rank is not None:
     self.fused_qkv_a_proj = MergedColumnParallelLinear(
         self.hidden_size, # 7168
@@ -28,27 +58,41 @@ if self.q_lora_rank is not None:
         disable_tp=True,
     )
 ```
-MergedColumnParallelLinear 是多个矩阵 tp 切分，每个矩阵取一个分片后合并做一次乘法。
+MergedColumnParallelLinear 是多个矩阵 TP 切分，每个矩阵取一个分片后合并做一次乘法。
+
 #### 1.2 RoPE
-只对每个 head 后 64 维做 RoPE。
+
+只对每个 head 后 64 维做 RoPE。位置编码只作用于 query 和 key 的 rope 部分。
+
+**RoPE 公式**：
+
+$$\mathbf{q}_i^{\text{rope}} = \text{RoPE}(\mathbf{q}_i), \quad i \in [d_{qk}^{\text{nope}}, d_{qk}^{\text{nope}} + d_r)$$
+
+$$\mathbf{k}_{\text{pe}} = \text{RoPE}(\mathbf{k}_{\text{pe}})$$
+
 ```python
+# File: vllm/model_executor/layers/mla.py:154
 q[..., self.qk_nope_head_dim :], k_pe = self.rotary_emb(
     positions, q[..., self.qk_nope_head_dim :], k_pe
 ) # qk_nope_head_dim=128, qk_rope_head_dim=64
 ```
 
 #### 1.3 Indexer
-v3.2 专属模块，轻量的 L^2 计算每个 q 最高的分数。结果存到内部 buffer 里，这里返回的没用。
-```
+
+V3.2 专属模块，轻量的 L² 计算每个 q 最高的分数。结果存到内部 buffer 里，这里返回的没用。
+```python
+# File: vllm/model_executor/layers/mla.py:158
 if self.indexer and self.is_sparse:
     _topk_indices = self.indexer(
         hidden_states, q_c, positions, self.indexer_rope_emb
     )
 ```
 
-#### 1.4 attention
+#### 1.4 Attention
+
 先看外层调用。use_direct_call=true 走 python 实现，否则作为一个融合算子，需要看底层 backend(flash infer/triton MLA/flash attn) 实现。
 ```python
+# File: vllm/attention/layer.py (MLAAttention.forward)
         if self.use_direct_call:
             forward_context: ForwardContext = get_forward_context()
             attn_metadata = forward_context.attn_metadata
@@ -90,13 +134,23 @@ if self.indexer and self.is_sparse:
                     k_pe,
                     self.layer_name,
                 )
-其中 kv_c_normed 是压缩后的 kv，每个 token 512 维，在用的时候会先up projection 到 kv_head * head_size 再融合 k_pe？
 ```
-#### 1.5 output projection
-需要注意的是这里隐含了 all reduce
+其中 kv_c_normed 是压缩后的 kv，每个 token 512 维，在用的时候会先 up projection 到 kv_head * head_size 再融合 k_pe。
+
+**Attention 计算**：
+
+$$\text{KV}_{\text{full}} = \text{UpProj}(\text{KV}_c) \in \mathbb{R}^{h \times (d_{qk}^{\text{nope}} + d_v)}$$
+
+$$\text{Attention}(\mathbf{Q}, \text{KV}) = \text{softmax}\left(\frac{\mathbf{Q}\mathbf{K}^T}{\sqrt{d_k}}\right)\mathbf{V}$$
+
+#### 1.5 Output Projection
+
+需要注意的是这里隐含了 all reduce。
+
 ```python
+# File: vllm/model_executor/layers/mla.py:173
 return self.o_proj(attn_out)[0]
-# o_proj 定义
+# o_proj 定义 (vllm/model_executor/models/deepseek_v2.py:1001)
 self.o_proj = RowParallelLinear(
     self.num_heads * self.v_head_dim,
     self.hidden_size,
@@ -105,18 +159,41 @@ self.o_proj = RowParallelLinear(
     prefix=f"{prefix}.o_proj",
 )
 ```
-tips：RowParallelLinear 和 ColumnParallelLinear 一般配合使用，ColumnParallelLinear 做切片下的 up projection（tensor parallel）, 过完激活函数再用 RowParallelLinear 收集信息。因此 ColumnParallelLinear 类 gather 默认 false，RowParallelLinear 类 reduce 默认 true。
 
-### 2 MoE
-#### 2.1 SP
-和 MLA 那一层的 SP 优化不是一个概念。在 MLA 结束后，在一个 DP Group 里，每张卡的 hidden_states 是相同的，然后在这里把 hidden_states 按 token 那一维切分，分布到不同 TP rank 上。这样后面跑 MoE 的时候 token 不会重复，减小激活值和计算量。想的很美好，但是事实上后面 MoE dispatch 默认实现是 all gather，刚切的 token 又被合并起来了，其实意义不是很大。（也许是减小 gate 和共享专家的激活值和计算量？）
+**输出投影公式**：
+
+$$\mathbf{o} = \mathbf{W}_o \cdot \text{attn\_out} \in \mathbb{R}^{d}$$
+
+其中 $\mathbf{W}_o \in \mathbb{R}^{d \times h \cdot d_v}$，RowParallelLinear 会执行 all-reduce 操作。
+
+**Tips**：RowParallelLinear 和 ColumnParallelLinear 在 MLP 结构里大量使用，ColumnParallelLinear 做切片下的 up projection（Tensor Parallel），过完激活函数再用 RowParallelLinear 做切片下的 down projection 然后 reduce 求和。因此 ColumnParallelLinear 类 gather 默认 false，RowParallelLinear 类 reduce 默认 true。
+
+---
+
+### 2 MoE (Mixture of Experts)
+
+#### 2.1 Sequence Parallel (SP)
+
+和 MLA 那一层的 SP 优化不是一个概念。在 MLA 结束后，在一个 DP Group 里，每张卡的 hidden_states 是相同的，然后在这里把 hidden_states 按 token 那一维切分，分布到不同 TP rank 上。这样后面跑 MoE gate 或者共享专家的时候 token 不会重复，减小激活值和计算量。
+
+**SP 切分公式**：
+
+$$\mathbf{H}_{\text{tp\_rank}} = \text{Split}(\mathbf{H}, \text{dim}=0)[\text{tp\_rank}]$$
+
+假设 TP size = $T$，sequence length = $L$：
+
+$$\mathbf{H} \in \mathbb{R}^{L \times d} \rightarrow \mathbf{H}_i \in \mathbb{R}^{\lceil L/T \rceil \times d}, \quad i = 0, 1, ..., T-1$$
+
 ```python
+# File: vllm/model_executor/models/deepseek_v2.py:346
 # Chunk the hidden states so they aren't replicated across TP ranks.
 # This avoids duplicate computation in self.experts.
 # TODO: We can replace the all_reduce at the end of attn with a
 # reduce_scatter instead of chunking here.
 if self.is_sequence_parallel:
     hidden_states = sequence_parallel_chunk(hidden_states)
+
+# File: vllm/model_executor/models/utils.py:778
 # 切分实现
 def sequence_parallel_chunk_impl(x: torch.Tensor) -> torch.Tensor:
     tp_size = get_tensor_model_parallel_world_size()
@@ -135,10 +212,23 @@ def sequence_parallel_chunk_impl(x: torch.Tensor) -> torch.Tensor:
     start = tp_rank * chunk
     return torch.narrow(y, 0, start, chunk)
 ```
-vllm 官方在这有个性能优化的注释，这里的切分可以挪到 MLA 最后用 reduce_scatter 实现。（现在 MLA 最后是 all reduce 合并结果）
-#### 2.2 gate
-gate 是线性映射，从隐藏层生成 256 个专家分数 router_logits，是 MoE 的第一步
+
+vLLM 官方在这有个性能优化的注释，这里的切分可以挪到 MLA 最后用 reduce_scatter 实现。（现在 MLA 最后是 all reduce 合并结果）
+
+#### 2.2 Gate
+
+gate 是线性映射，从隐藏层生成 256 个专家分数 router_logits，是 MoE 的第一步。
+
+**Router 计算**：
+
+$$\mathbf{r} = \mathbf{W}_g \cdot \mathbf{h} \in \mathbb{R}^{E}$$
+
+$$\mathbf{w} = \text{TopK-Softmax}(\mathbf{r}, k) \in \mathbb{R}^{E}$$
+
+其中 $E$ 为专家总数 (n_routed_experts = 256)，$k$ 为 top_k。
+
 ```python
+# File: vllm/model_executor/models/deepseek_v2.py:261
 self.gate = ReplicatedLinear(
     config.hidden_size,
     config.n_routed_experts,
@@ -147,22 +237,31 @@ self.gate = ReplicatedLinear(
     prefix=f"{prefix}.gate",
 )
 ```
-#### 2.3 mixtral of experts
-MoE 有个很关键的环境变量 VLLM_ALL2ALL_BACKEND. 默认 allgather_reducescatter 会用 ag_rs 替代 all_to_allv，这样整个 MoE 的逻辑就很 simple，self.quant_method 不会被替换为 FusedMoEModularMethod，没有抽象替换。
+
+#### 2.3 Mixture of Experts
+
+MoE 有个很关键的环境变量 VLLM_ALL2ALL_BACKEND。默认 allgather_reducescatter 会用 ag_rs 替代 all_to_allv，这样整个 MoE 的逻辑就很 simple，self.quant_method 不会被替换为 FusedMoEModularMethod，没有抽象替换。
+
 ```python
-    VLLM_ALL2ALL_BACKEND: Literal[
-        "naive",
-        "pplx",
-        "deepep_high_throughput",
-        "deepep_low_latency",
-        "allgather_reducescatter",
-        "flashinfer_all2allv",
-    ] = "allgather_reducescatter"
+# File: vllm/config/__init__.py (或 vllm/envs.py)
+VLLM_ALL2ALL_BACKEND: Literal[
+    "naive",
+    "pplx",
+    "deepep_high_throughput",
+    "deepep_low_latency",
+    "allgather_reducescatter",
+    "flashinfer_all2allv",
+] = "allgather_reducescatter"
 ```
+
 ##### 2.3.1 默认实现
+
 默认实现下，self.quant_method 不会被替换为 FusedMoEModularMethod，就是个简单的 FFN。会走 do_naive_dispatch_combine=True 的逻辑。
+
 ###### 主干逻辑
+
 ```python
+# File: vllm/model_executor/layers/fused_moe/layer.py:1889
     def forward_impl(
         self,
         hidden_states: torch.Tensor,
@@ -181,7 +280,7 @@ MoE 有个很关键的环境变量 VLLM_ALL2ALL_BACKEND. 默认 allgather_reduce
         )
 
         with sp_ctx:
-            # dispatch 逻辑，底层是 all gather，
+            # dispatch 逻辑，底层是 all gather
             if do_naive_dispatch_combine:
                 hidden_states_combined, router_logits = get_ep_group().dispatch(
                     hidden_states, router_logits, self.is_sequence_parallel
@@ -260,11 +359,15 @@ MoE 有个很关键的环境变量 VLLM_ALL2ALL_BACKEND. 默认 allgather_reduce
             else:
                 return combine_output(final_hidden_states)
 ```
-上面这个默认实现还是很简单的 dispatch(allgather)+fused_experts+combine(reducescatter)。
-唯一需要注意的是 dispatch 和 combine 都有是否开启 sp 的入参。显然 dispatch 和 combine 是在 ep 域内做的，之前 sp 只在 dp 域内（ep=dp*tp）。
- * 如果之前如果没做 sp，dp 域内每个卡上数据是一样的，dispatch 就不需要在 dp 域内 gather 数据。
- * 如果之前如果没做 sp，combine 就不需要把 token 分到整个 ep 域，在 dp 域内每个 tp rank 的 hidden_states 一样。
+
+上面这个默认实现还是很简单的 dispatch(allgather) + fused_experts + combine(reducescatter)。
+
+唯一需要注意的是 dispatch 和 combine 都有是否开启 SP 的入参。显然 dispatch 和 combine 是在 EP 域内做的，之前 SP 只在 DP 域内（EP = DP × TP）。
+- 如果之前如果没做 SP，DP 域内每个卡上数据是一样的，dispatch 就不需要在 DP 域内 gather 数据。
+- 如果之前如果没做 SP，combine 就不需要把 token 分到整个 EP 域，在 DP 域内每个 TP rank 的 hidden_states 一样。
+
 ```python
+# File: vllm/distributed/device_communicators/all2all.py:102
 class AgRsAll2AllManager(All2AllManagerBase):
     """
     An implementation of all2all communication based on
@@ -315,9 +418,20 @@ class AgRsAll2AllManager(All2AllManagerBase):
     def destroy(self):
         pass
 ```
-###### fused_experts
-主干代码
+
+###### Fused Experts
+
+**Expert 前向公式**：
+
+$$\mathbf{y}_i = \text{FFN}_i(\mathbf{x}_i) = \mathbf{W}_2^{(i)} \cdot \sigma(\mathbf{W}_1^{(i)} \cdot \mathbf{x}_i) \odot (\mathbf{W}_3^{(i)} \cdot \mathbf{x}_i)$$
+
+$$\mathbf{y} = \sum_{i \in \text{topk}} w_i \cdot \mathbf{y}_i$$
+
+其中 $\sigma$ 为激活函数（SiLU），$\odot$ 为逐元素乘法，$w_i$ 为 router weight。
+
+主干代码：
 ```python
+# File: vllm/model_executor/layers/fused_moe/fused_moe.py:1740
 def fused_experts_impl(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,
@@ -478,27 +592,31 @@ def fused_experts_impl(
 
     return out_hidden_states
 ```
-然后来看最核心的专家计算逻辑。不看量化，核心关注下面几个步骤
-1. **moe_align_block_size**：重排 token_id，按照专家顺序排，并且 pad token 到后续乘法的 batch size。要配合后面乘法的 kernel 调用能更好理解这个的作用。vllm 注释里有个例子：
- Given topk_ids = [[2, 3, 4], [1, 2, 4], [1, 3, 4], [1, 2, 3]],
-    block_size = 4, and num_experts = 4:
- - We initially have 12 tokens (after repeating 'top_k' times) and 4 experts,
-        with each expert needing to process 3 tokens.
-    - As block_size is 4, we pad 1 token for each expert.
-    - First, flatten topk_ids to [2, 3, 4, 1, 2, 4, 1, 3, 4, 1, 2, 3].
-    - Then append padding tokens [12, 12, 12, 12] for each block.
-    - After sorting by expert index, we obtain token_ids
-        [3, 6, 9, 12, 0, 4, 10, 12, 1, 7, 11, 12, 2, 5, 8, 12].
-        Tokens 12 are non-existent (padding) and are ignored in
-        the subsequent matrix multiplication.
-    - The padding ensures that the total number of tokens is now divisible
-        by block_size for proper block matrix operations.
 
+然后来看最核心的专家计算逻辑。不看量化，核心关注下面几个步骤：
+
+1. **moe_align_block_size**：重排 token_id，按照专家顺序排，并且 pad token 到后续乘法的 batch size。要配合后面乘法的 kernel 调用能更好理解这个的作用。vLLM 注释里有个例子：
+
+   Given topk_ids = [[2, 3, 4], [1, 2, 4], [1, 3, 4], [1, 2, 3]],
+   block_size = 4, and num_experts = 4:
+   - We initially have 12 tokens (after repeating 'top_k' times) and 4 experts,
+         with each expert needing to process 3 tokens.
+     - As block_size is 4, we pad 1 token for each expert.
+     - First, flatten topk_ids to [2, 3, 4, 1, 2, 4, 1, 3, 4, 1, 2, 3].
+     - Then append padding tokens [12, 12, 12, 12] for each block.
+     - After sorting by expert index, we obtain token_ids
+         [3, 6, 9, 12, 0, 4, 10, 12, 1, 7, 11, 12, 2, 5, 8, 12].
+         Tokens 12 are non-existent (padding) and are ignored in
+         the subsequent matrix multiplication.
+     - The padding ensures that the total number of tokens is now divisible
+         by block_size for proper block matrix operations.
 
 2. **invoke_fused_moe_kernel**(第一次调用，up projection)：
- 介绍下关键的 fused_moe_kernel 逻辑。
- 先从 topk_ids 数组取左矩阵下标。注意这里 offs_token//top_k 是因为每个 token_id 之前 moe_align_block_size 里都复制了 k 分，比如 0->(0,1,...,k-1)，1->(k,...,2k-1)
+
+   介绍下关键的 fused_moe_kernel 逻辑：先从 topk_ids 数组取左矩阵下标。注意这里 offs_token//top_k 是因为每个 token_id 之前 moe_align_block_size 里都复制了 k 分，比如 0→(0,1,...,k-1)，1→(k,...,2k-1)。
+
 ```python
+# File: vllm/model_executor/layers/fused_moe/fused_moe.py (fused_moe_kernel)
     offs_token_id = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M).to(tl.int64)
     offs_token = tl.load(sorted_token_ids_ptr + offs_token_id)
     token_mask = offs_token < num_valid_tokens
@@ -506,8 +624,11 @@ def fused_experts_impl(
         offs_token[:, None] // top_k * stride_am + offs_k[None, :] * stride_ak
     )
 ```
-然后是右矩阵下标。因为 fused_moe_kernel 每个 thread 只算一个 block，每个 block 是同一个专家，所以取这个专家就行
+
+然后是右矩阵下标。因为 fused_moe_kernel 每个 thread 只算一个 block，每个 block 是同一个专家，所以取这个专家就行。
+
 ```python
+# File: vllm/model_executor/layers/fused_moe/fused_moe.py (fused_moe_kernel)
     off_experts = tl.load(expert_ids_ptr + pid_m).to(tl.int64)
     b_ptrs = (
         b_ptr
@@ -515,8 +636,11 @@ def fused_experts_impl(
         + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
     )
 ```
+
 然后是矩阵乘法。会分块相乘再求和，只按矩阵相乘那一维分块。
+
 ```python
+# File: vllm/model_executor/layers/fused_moe/fused_moe.py (fused_moe_kernel)
     for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
         # Load the next block of A and B, generate a mask by checking the
         # K dimension.
@@ -551,14 +675,25 @@ def fused_experts_impl(
         a_ptrs += BLOCK_SIZE_K * stride_ak
         b_ptrs += BLOCK_SIZE_K * stride_bk
 ```
-需要注意的是 A 内存是不连续的，因为 token 下标不连续。问了几个 AI 说 triton load A 到寄存器里就连续了，所以还是一次矩阵乘法，只不过会有不连续内存 gather 的开销。所以 vllm MoE 非默认实现里会有 permute/unpermute，提前把 A 的内存排成连续。
 
-还有一些不怎么重要的细节，比如expert=-1的时候直接全零输出，这里不看了。
+需要注意的是 A 内存是不连续的，因为 token 下标不连续。问了几个 AI 说 triton load A 到寄存器里就连续了，所以还是一次矩阵乘法，只不过会有不连续内存 gather 到一起的开销。所以 vLLM MoE 非默认实现里会有 permute/unpermute，提前把 A 的内存排成连续。
 
+还有一些不怎么重要的细节，比如 expert=-1 的时候直接全零输出，这里不看了。
 
 3. **activation**：
-这里就是带不带 gate 的区别。with_mul/no_mul 两种。如果是带门控的，前面 up projection 算出来是 2*N 的结果（intermediate_cache1），先 view 成 N 然后切分计算 silu(x[:middle,]) * (x[middle:,])。
+
+   这里就是带不带 gate 的区别。with_mul/no_mul 两种。如果是带门控的，前面 up projection 算出来是 2×N 的结果（intermediate_cache1），先 view 成 N 然后切分计算 silu(x[:middle]) × (x[middle:])。
+
+**SiLU 激活公式**：
+
+$$\text{SiLU}(x) = x \cdot \sigma(x) = \frac{x}{1 + e^{-x}}$$
+
+**SwiGLU 公式**：
+
+$$\text{SwiGLU}(\mathbf{x}, \mathbf{W}, \mathbf{V}, \mathbf{b}, \mathbf{c}) = \text{Swish}(\mathbf{x}\mathbf{W} + \mathbf{b}) \odot (\mathbf{x}\mathbf{V} + \mathbf{c})$$
+
 ```python
+# File: vllm/model_executor/layers/fused_moe/fused_moe.py (fused_experts_impl)
         # Activation function with multiplication
         if activation == "silu":
             torch.ops._C.silu_and_mul(
@@ -583,27 +718,39 @@ def fused_experts_impl(
         else:
             raise ValueError(f"Unsupported FusedMoe activation: {activation}.")
 ```
-4. **invoke_fused_moe_kernel**(第二次调用, down projection)： 
-这里是可以在 kernel 里把 router score 乘进去的。
+
+4. **invoke_fused_moe_kernel**(第二次调用, down projection)：
+
+   这里是可以在 kernel 里把 router score 乘进去的。
+
 ```python
+# File: vllm/model_executor/layers/fused_moe/fused_moe.py (fused_moe_kernel)
     if MUL_ROUTED_WEIGHT:
         moe_weight = tl.load(topk_weights_ptr + offs_token, mask=token_mask, other=0)
         accumulator = accumulator * moe_weight[:, None]
 ```
+
 5. **ops.moe_sum**：
-每个 token 在这个 ep rank 上所有专家的计算结果进行汇总。
+
+   每个 token 在这个 EP rank 上所有专家的计算结果进行汇总。
 
 ###### 通信后端
-MoE dispatch 默认后端是 all gather+reduce scatter（vllm/distributed/device_communicators/all2all.py）. 如果用 all to allv 后端要显式指定并且安装额外依赖。比如 pplx, deepep, flashinfer_all2allv 等。为什么默认不用原生的 all to allv?
- * 通用和兼容性。
- * 小规模数据 ag+rs 性能更好，all2all 还有额外头开销影响时延（是吗？）。而且 nvlink 的带宽很高，推理的通信量不像训练那么大，ag+rs 性能和 all2all 区别不大。
- * ag+rs 可以和前后操作做通信-计算掩盖。这块要再研究一下。
 
+MoE dispatch 默认后端是 all gather + reduce scatter（vllm/distributed/device_communicators/all2all.py）。如果用 all to allv 后端要显式指定并且安装额外依赖。比如 pplx, deepep, flashinfer_all2allv 等。
 
-用了 all gather 后有个很奇怪的问题，前面有 SP 逻辑把 token 分发到不同 tp rank 上，这里又 all gather 把所有 token 在 ep group 里全合起来，看起来有点多余。也许是减小 gate 和共享专家的激活值和计算量？
+**为什么默认不用原生的 all_to_allv？**
+- 通用和兼容性。
+- 小规模数据 AG+RS 性能更好，all2all 还有额外头开销影响时延（是吗？）。而且 NVLink 的带宽很高，推理的通信量不像训练那么大，AG+RS 性能和 all2all 区别不大。
+- AG+RS 可以和前后操作做通信-计算掩盖。这块要再研究一下。
+
+用了 all gather 后有个很奇怪的问题，前面有 SP 逻辑把 token 分发到不同 TP rank 上，这里又 all gather 把所有 token 在 EP group 里全合起来，看起来有点多余。也许是减小 gate 和共享专家的激活值和计算量？
+
 ##### 2.3.2 模块化替换
-非默认实现比如 pplx/deepep/flashinfer_all2allv 都被 vllm 做成 [模块化抽象](https://github.com/vllm-project/vllm/blob/main/docs/design/fused_moe_modular_kernel.md) 了。主干逻辑在 FusedMoEModularKernel：
+
+非默认实现比如 pplx/deepep/flashinfer_all2allv 都被 vLLM 做成 [模块化抽象](https://github.com/vllm-project/vllm/blob/main/docs/design/fused_moe_modular_kernel.md) 了。主干逻辑在 FusedMoEModularKernel：
+
 ```python
+# File: vllm/model_executor/layers/fused_moe/modular_kernel.py
 @final
 class FusedMoEModularKernel(torch.nn.Module):
     def forward(
@@ -667,9 +814,15 @@ class FusedMoEModularKernel(torch.nn.Module):
             use_shared_experts_stream=use_shared_experts_stream,
         )
 ```
-## 代码问题
-在 MoE 里有这么一段代码，根据是不是 tpu 调用 torch.ops.vllm.moe_forward 和 self.forward_impl
+
+---
+
+### 代码问题
+
+在 MoE 里有这么一段代码，根据是不是 TPU 调用 torch.ops.vllm.moe_forward 和 self.forward_impl：
+
 ```python
+# File: vllm/model_executor/layers/fused_moe/layer.py:301
 class FusedMoE(CustomOp):
     def forward_native():
         if current_platform.is_tpu():
@@ -682,8 +835,11 @@ class FusedMoE(CustomOp):
                 hidden_states, router_logits, self.layer_name
             )
 ```
+
 但是事实上 torch.ops.vllm.moe_forward 就是 self.forward_impl，在文件末尾有这个注册逻辑：
+
 ```python
+# File: vllm/model_executor/layers/fused_moe/layer.py (文件末尾)
 direct_register_custom_op(
     op_name="moe_forward",
     op_func=moe_forward,
@@ -692,5 +848,7 @@ direct_register_custom_op(
     tags=(torch.Tag.needs_fixed_stride_order,),
 )
 ```
+
 这里就产生了一个问题：为什么相同的函数调用在 if-else 两个分支里，看上去可以合并？
-gemini 的回答是这两个函数在 torch.compile 下有区别。torch.ops.vllm.moe_forward 是被注册的 customop，torch.compile 会把它看做一个黑盒，一个原子操作，而 self.forward_impl 内部是对 torch.compile 可见的，编译的时候会对里面的图做优化。
+
+Gemini 的回答是这两个函数在 torch.compile 下有区别。torch.ops.vllm.moe_forward 是被注册的 custom op，torch.compile 会把它看做一个黑盒，一个原子操作，而 self.forward_impl 内部是对 torch.compile 可见的，编译的时候会对里面的图做优化。
