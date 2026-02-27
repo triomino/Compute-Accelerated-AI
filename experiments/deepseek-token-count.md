@@ -157,7 +157,7 @@ for question in test_questions:
         {"role": "assistant", "content": "<think>Hmm</think>I am DeepSeek"},
         {"role": "user", "content": question},
     ]
-    extra_body = {"chat_template_kwargs": {"enable_thinking": True}}
+    extra_body = {"chat_template_kwargs": {"enable_thinking": True, "thinking": True}}
     response = client.chat.completions.create(
         model=model,
         messages=messages,
