@@ -1,0 +1,234 @@
+# =============================================================================
+# vLLM-Ascend PD分离部署配置文件
+# 说明: 修改此文件来配置您的部署环境，然后运行 python deploy.py deploy --config config.yaml
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# 全局配置
+# -----------------------------------------------------------------------------
+global:
+  # 模型配置
+  model:
+    path: "/mnt/sfs_turbo/GLM-5-w8a8-new"  # 模型权重路径
+    name: "dsv3"                           # 服务模型名称
+    max_model_len: 120000                  # 最大模型序列长度
+    quantization: "ascend"                 # 量化方式 (ascend/w8a8等)
+  
+  # vLLM通用配置
+  vllm:
+    gpu_memory_utilization: 0.9            # GPU显存利用率
+    max_num_seqs: 16                       # 最大并发序列数
+    max_num_batched_tokens: 8192           # 最大批处理token数
+    enable_expert_parallel: true           # 启用专家并行
+    trust_remote_code: true                # 信任远程代码
+    seed: 1024                             # 随机种子
+    enforce_eager: true                    # 强制eager模式
+  
+  # 推测解码配置
+  speculative:
+    enabled: true
+    num_speculative_tokens: 3
+    method: "deepseek_mtp"
+  
+  # Mooncake KV Transfer配置
+  kv_transfer:
+    connector: "MooncakeConnectorV1"
+    use_ascend_direct: true
+    prefill_port: "30000"    # P层Mooncake端口
+    decode_port: "30199"     # D层Mooncake端口
+  
+  # 全局环境变量 (所有节点通用)
+  env:
+    HCCL_OP_EXPANSION_MODE: "AIV"
+    OMP_PROC_BIND: "false"
+    OMP_NUM_THREADS: 10
+    PYTORCH_NPU_ALLOC_CONF: "expandable_segments:True"
+    VLLM_USE_V1: 1
+    HCCL_BUFFSIZE: 256
+    ASCEND_AGGREGATE_ENABLE: 1
+    ASCEND_TRANSPORT_PRINT: 1
+    ACL_OP_INIT_MODE: 1
+    ASCEND_A3_ENABLE: 1
+    VLLM_NIXL_ABORT_REQUEST_TIMEOUT: 300000
+
+# -----------------------------------------------------------------------------
+# P (Prefill) 节点配置 - 负责prompt处理
+# -----------------------------------------------------------------------------
+prefill:
+  # P层整体配置
+  dp_size: 2              # P层总DP数 (数据并行度)
+  tp_size: 16             # P层TP数 (张量并行度，每张卡数)
+  base_port: 9100         # P层起始端口
+  
+  # P节点列表
+  nodes:
+    - name: "p-node-1"
+      host: "192.168.0.32"     # 节点IP地址
+      ssh:
+        user: "root"
+        port: 22
+        key_file: "~/.ssh/id_rsa"  # SSH私钥路径
+      docker:
+        enabled: true
+        container_name: "vllm-ascend-p1"
+        image: "vllm-ascend:glm5-0.13.0-a3"
+        workdir: "/mnt/sfs_turbo/glm5_PD/P/glm5_dp2_tp16/node1"
+      local_dp_size: 1      # 该节点上的DP实例数
+      dp_rank_start: 0      # DP起始rank
+      dp_rpc_port: 12899    # DP RPC通信端口
+      vllm_start_port: 9100 # vLLM服务起始端口
+      nic_name: "enp23s0f3" # 网卡名称
+      env_override:         # 节点级环境变量覆盖
+        VLLM_ASCEND_ENABLE_FLASHCOMM1: 1
+        VLLM_ASCEND_ENABLE_MLAPO: 1
+      
+    - name: "p-node-2"
+      host: "192.168.0.211"
+      ssh:
+        user: "root"
+        port: 22
+        key_file: "~/.ssh/id_rsa"
+      docker:
+        enabled: true
+        container_name: "vllm-ascend-p2"
+        image: "vllm-ascend:glm5-0.13.0-a3"
+        workdir: "/mnt/sfs_turbo/glm5_PD/P/glm5_dp2_tp16/node2"
+      local_dp_size: 1
+      dp_rank_start: 1      # 注意：rank连续不重复
+      dp_rpc_port: 12899
+      vllm_start_port: 9100
+      nic_name: "enp23s0f3"
+      env_override:
+        VLLM_ASCEND_ENABLE_FLASHCOMM1: 1
+        VLLM_ASCEND_ENABLE_MLAPO: 1
+
+# -----------------------------------------------------------------------------
+# D (Decode) 节点配置 - 负责token生成
+# -----------------------------------------------------------------------------
+decode:
+  # D层整体配置
+  dp_size: 16             # D层总DP数
+  tp_size: 4              # D层TP数 (每张卡数)
+  base_port: 9100         # D层起始端口
+  
+  # D节点列表
+  nodes:
+    - name: "d-node-1"
+      host: "192.168.0.176"
+      ssh:
+        user: "root"
+        port: 22
+        key_file: "~/.ssh/id_rsa"
+      docker:
+        enabled: true
+        container_name: "vllm-ascend-d1"
+        image: "vllm-ascend:glm5-0.13.0-a3"
+        workdir: "/mnt/sfs_turbo/glm5_PD/D/glm5_dp8_w8a8_6machine/node1"
+      local_dp_size: 4      # 该节点运行4个DP实例
+      dp_rank_start: 0      # DP rank 0-3
+      dp_rpc_port: 13003
+      vllm_start_port: 9100
+      nic_name: "enp23s0f3"
+      env_override:
+        TASK_QUEUE_ENABLE: 1
+      
+    - name: "d-node-2"
+      host: "192.168.0.76"
+      ssh:
+        user: "root"
+        port: 22
+        key_file: "~/.ssh/id_rsa"
+      docker:
+        enabled: true
+        container_name: "vllm-ascend-d2"
+        image: "vllm-ascend:glm5-0.13.0-a3"
+        workdir: "/mnt/sfs_turbo/glm5_PD/D/glm5_dp8_w8a8_6machine/node2"
+      local_dp_size: 4      # DP rank 4-7
+      dp_rank_start: 4
+      dp_rpc_port: 13003
+      vllm_start_port: 9100
+      nic_name: "enp23s0f3"
+      env_override:
+        TASK_QUEUE_ENABLE: 1
+      
+    - name: "d-node-3"
+      host: "192.168.0.167"
+      ssh:
+        user: "root"
+        port: 22
+        key_file: "~/.ssh/id_rsa"
+      docker:
+        enabled: true
+        container_name: "vllm-ascend-d3"
+        image: "vllm-ascend:glm5-0.13.0-a3"
+        workdir: "/mnt/sfs_turbo/glm5_PD/D/glm5_dp8_w8a8_6machine/node3"
+      local_dp_size: 4      # DP rank 8-11
+      dp_rank_start: 8
+      dp_rpc_port: 13003
+      vllm_start_port: 9100
+      nic_name: "enp23s0f3"
+      env_override:
+        TASK_QUEUE_ENABLE: 1
+      
+    - name: "d-node-4"
+      host: "192.168.0.59"
+      ssh:
+        user: "root"
+        port: 22
+        key_file: "~/.ssh/id_rsa"
+      docker:
+        enabled: true
+        container_name: "vllm-ascend-d4"
+        image: "vllm-ascend:glm5-0.13.0-a3"
+        workdir: "/mnt/sfs_turbo/glm5_PD/D/glm5_dp8_w8a8_6machine/node4"
+      local_dp_size: 4      # DP rank 12-15
+      dp_rank_start: 12
+      dp_rpc_port: 13003
+      vllm_start_port: 9100
+      nic_name: "enp23s0f3"
+      env_override:
+        TASK_QUEUE_ENABLE: 1
+
+# -----------------------------------------------------------------------------
+# Proxy 负载均衡配置
+# -----------------------------------------------------------------------------
+proxy:
+  enabled: true
+  host: "192.168.0.100"     # Proxy所在机器IP
+  port: 8000                # Proxy监听端口
+  ssh:
+    user: "root"
+    port: 22
+    key_file: "~/.ssh/id_rsa"
+  docker:
+    enabled: false          # Proxy通常在宿主机运行
+    workdir: "/mnt/sfs_turbo/glm5_PD"
+  script_path: "load_balance_proxy_server_fixed.py"
+  
+  # 注意：prefiller-hosts/ports 和 decoder-hosts/ports 会自动从 prefill/decode 配置生成
+  # 不需要手动填写
+
+# -----------------------------------------------------------------------------
+# 部署配置
+# -----------------------------------------------------------------------------
+deployment:
+  # 脚本生成目录 (本地)
+  output_dir: "./generated"
+  
+  # 远程部署路径 (各机器上)
+  remote_base_path: "/mnt/sfs_turbo/glm5_PD_deploy"
+  
+  # 部署顺序
+  deploy_order:
+    - "prefill"    # 先部署P层
+    - "decode"     # 再部署D层
+    - "proxy"      # 最后部署Proxy
+  
+  # 启动等待时间(秒)
+  startup_delay: 10
+  
+  # 健康检查配置
+  health_check:
+    enabled: true
+    timeout: 300
+    interval: 5
