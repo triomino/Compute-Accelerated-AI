@@ -3,26 +3,37 @@
 现代大语言模型权重很大，动辄上百 G，没法放在一张卡上，按照矩阵乘法的特性很自然想到切分存放权重，tensor parallel（简称TP） 是基于这种想法的朴素实现。本文用一个简单的 MLP 结构举例说明推理时 TP 的实现。
 ### 非切分场景
 一个经典的 MLP 结构（升维、激活函数、降维）：
-$$y=\text{act}(x\times w_1)\times w_2$$
+
+$$
+y=\text{act}(x\times w_1)\times w_2
+$$
+
 $x$ 是输入，乘 $w_1$ 是升维，所以在图里画的比较宽。乘 $w_2$ 是降维，所以图里画的比较瘦长。最后输出 $y$ 形状和 $x$ 一样。
 ![mlp](assets/mlp.drawio.png)
 ### 切分场景
 假设在两卡上切分，把 $w_1$ 按列切分，分别放到 device 1 和 device 2，这样升维可以自然地变成两个独立的矩阵乘法运算。再分别经过激活函数得到 $x_3$ 的两个切片，记 $x_3=[A\ B]$。
-降维稍微麻烦一点，记 $w_{\text{2}} =
+降维稍微麻烦一点，记 $
+w_{\text{2}} =
 \begin{bmatrix}
 C \\
 D
-\end{bmatrix}$，那么
-$$x_3\times w_2=[A\ B]\times \begin{bmatrix}
+\end{bmatrix}
+$
+，那么
+$$
+x_3\times w_2=[A\ B]\times \begin{bmatrix}
 C \\
 D
-\end{bmatrix}=A\times C+B\times D$$
-device 1 持有 A，C, device 2 持有 B，D，所以两边单独做乘法，然后 all_reduce 求和就得到了之前未切分的 $x_4$
+\end{bmatrix}=A\times C+B\times D
+$$
+device 1 持有 $A$，$C$, device 2 持有 $B$，$D$，所以两边单独做乘法，然后 all_reduce 求和就得到了之前未切分的 $x_4$
 
 ![mlp_tp](assets/mlp_tp.drawio.png)
+### DeepSeek MoE 切分(TODO)
+现代 MoE 里的专家和上面这个 MLP 结构相似，只是其中的激活函数换成了带门控的激活函数。
 ### vllm 切分代码
 我们能经常在 vllm 的模型结构里看到 [ColumnParallelLinear](https://github.com/vllm-project/vllm/blob/fad09e8a1f51b31eba1f42ff5d651256c77a734d/vllm/model_executor/layers/linear.py#L407) 和 [RowParallelLinear](https://github.com/vllm-project/vllm/blob/fad09e8a1f51b31eba1f42ff5d651256c77a734d/vllm/model_executor/layers/linear.py#L1350) 层，就是用来干 TP 的。
-在上面这个例子中，$w_1$ 的切分就是 ColumnParallelLinear 实现。关键代码：
+在上面这个例子中， $w_1$ 的切分就是 ColumnParallelLinear 实现。关键代码：
 ```python
 class ColumnParallelLinear(LinearBase):
     def weight_loader(self, param: Parameter, loaded_weight: torch.Tensor):
@@ -59,6 +70,7 @@ class ColumnParallelLinear(LinearBase):
         output_bias = self.bias if self.skip_bias_add else None
         return output, output_bias
 ```
+
 $w_2$ 的切分对应 RowParallelLinear。
 
 ```python
@@ -102,3 +114,6 @@ class RowParallelLinear(LinearBase):
             return output
         output_bias = self.bias if self.skip_bias_add else None
         return output, output_bias
+
+
+TODO:MergedColumnParallelLinear
