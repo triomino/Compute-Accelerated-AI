@@ -8,5 +8,15 @@ PreNorm 即输入套 Norm: $x_{l+1} = x_l + \text{F}(\text{LN}(x_l))$ 。为什�
 
 ### mHC
 
+kernel 实现有个小细节，sinkhorn 迭代的时候第一轮 exp+row_norm(=softmax) 分母不加 eps，eps 在外面。这个 eps 有点意义不明，gpt 说是为了进 sinkhorn 迭代的时候所有元素 >0。（后面在分母里的 eps 目的很明确就是防止分母变 0）
+```python
+    T.reduce_max(comb_frag, row_max, dim=1)
+    for j, k in T.Parallel(hc, hc):
+        comb_frag[j, k] = T.exp(comb_frag[j, k] - row_max[j])
+    T.reduce_sum(comb_frag, row_sum, dim=1)
+    for j, k in T.Parallel(hc, hc):
+        comb_frag[j, k] = comb_frag[j, k] / row_sum[j] + eps # eps 在分母外
+```
+
 ### Math
-这里有个有趣的小知识，mHC 里面用到双随机矩阵，为什么行列和为 1 的矩阵会被命名为“双随机矩阵”？其实[随机矩阵](https://en.wikipedia.org/wiki/Stochastic_matrix)翻译成转移矩阵更贴近其含义，每行是一个概率分布， $p_{ij}$ 是状态 $i$ 到状态 $j$ 的概率，描述了一个有限状态空间的马尔可夫链。
+这里有个有趣的小知识，mHC 里面用到双随机矩阵，为什么行列和为 1 的非负矩阵会被命名为“双随机矩阵”？其实[随机矩阵](https://en.wikipedia.org/wiki/Stochastic_matrix)翻译成转移矩阵更贴近其含义，每行是一个概率分布， $p_{ij}$ 是状态 $i$ 到状态 $j$ 的概率，描述了一个有限状态空间的马尔可夫链。
